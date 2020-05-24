@@ -103,7 +103,7 @@ func (rf *Raft) switchTo(newState PeerState) {
 	rf.state = newState
 	if oldState == Leader && newState == Follower {
 		rf.nonLeaderCond.Broadcast()
-	} else if oldState == Follower && newState == Leader {
+	} else if oldState == Candidate && newState == Leader  {
 		rf.leaderCond.Broadcast()
 	}
 }
@@ -206,43 +206,53 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	DPrintf("Peer %d received vote request from Peer %d. CurrentTerm: %d, ArgsTerm: %d. VoteFor: %d",
 		rf.me, args.CandidateId, rf.currentTerm, args.Term, rf.voteFor)
-	reply.Vote = false
-	reply.Term = rf.currentTerm
-	reply.VoterId = rf.me
-	if args.Term < rf.currentTerm {
-		return
-	}
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.voteFor = VoteNil
-		rf.switchTo(Follower)
+
+	if rf.currentTerm <= args.Term {
+		if rf.currentTerm < args.Term {
+			rf.currentTerm = args.Term
+			rf.voteFor = VoteNil
+			rf.switchTo(Follower)
+		}
+
+		if rf.voteFor == VoteNil || rf.voteFor == args.CandidateId {
+			rf.voteFor = args.CandidateId
+			rf.resetElectionTimer()
+			rf.switchTo(Follower)
+			reply.Term = rf.currentTerm
+			reply.Vote = true
+			reply.VoterId = rf.me
+			DPrintf("Peer %d vote for Peer %d, %v", rf.me, args.CandidateId, reply)
+			return
+		}
 	}
 
-	// args.Term == rf.currentTerm
-	if rf.voteFor == VoteNil || rf.voteFor == args.CandidateId {
-		DPrintf("Voting to ...")
-		reply.Vote = true
-		rf.voteFor = args.CandidateId
-		rf.switchTo(Follower)
-		DPrintf("Peer %d vote for Peer %d, %v", rf.me, args.CandidateId, reply)
-		return
-	}
+	reply.Term = rf.currentTerm
+	reply.Vote = false
+	reply.VoterId = rf.me
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
-	reply.Succ = false
+	//reply.Term = rf.currentTerm
+	//reply.Succ = false
 
-	// 当前任期比心跳消息中的任期大，继续保持leader身份
-	if rf.currentTerm > args.Term {
+	// 当前任期比心跳消息中的任期小
+	if rf.currentTerm <= args.Term {
+		DPrintf("[AppendEntries]: Id %d Term %d received newer term %d", rf.me, rf.currentTerm, args.Term)
+		rf.currentTerm = args.Term
+		rf.resetElectionTimer()
+		rf.voteFor = VoteNil
+		rf.switchTo(Follower)
+
+		reply.Term = rf.currentTerm
+		reply.Succ = true
 		return
 	}
 
-	rf.voteFor = VoteNil
-	rf.switchTo(Follower)
-	reply.Succ = true
+	rf.resetElectionTimer()
+	reply.Term = rf.currentTerm
+	reply.Succ = false
 }
 
 //
@@ -285,9 +295,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+// 重置election timer，不加锁
 func (rf *Raft) resetElectionTimer() {
+	// 随机化种子以产生不同的伪随机数序列
 	rand.Seed(time.Now().UnixNano())
-	rf.electionTimeout = rf.heartbeatInterval*5 + rand.Intn(150)
+	// 重新选举随机的electionTimeout
+	rf.electionTimeout = rf.heartbeatInterval*5 + rand.Intn(300-150)
+	// 因为重置了选举超时，所以也需要更新latestHeardTime
 	rf.lastHeardTime = time.Now().UnixNano()
 }
 
@@ -299,62 +313,75 @@ func (rf *Raft) Vote() {
 	DPrintf("[ElectionTimeout] Id %d start to elect", rf.me)
 	rf.mu.Lock()
 	rf.currentTerm++
-	rf.state = Candidate
+	rf.switchTo(Candidate)
 	rf.voteFor = rf.me
-	args := RequestVoteArgs{
-		CandidateId: rf.me,
-		Term:        rf.currentTerm,
-	}
 	rf.resetElectionTimer()
 	rf.mu.Unlock()
-
-	var wg sync.WaitGroup
-
 	nVotes := 1 // 获得票数
-	majority := len(rf.peers)/2 + 1
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
+	go func(nVotes *int, rf *Raft) {
+		var wg sync.WaitGroup
+		majority := len(rf.peers)/2 + 1
+
+		for i, _ := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+
+			rf.mu.Lock()
+			wg.Add(1)
+			args := RequestVoteArgs{
+				CandidateId: rf.me,
+				Term:        rf.currentTerm,
+			}
+			rf.mu.Unlock()
+			var reply RequestVoteReply
+
+			go func(i int, rf *Raft, args *RequestVoteArgs, reply *RequestVoteReply) {
+				defer wg.Done()
+				ok := rf.sendRequestVote(i, args, reply)
+
+				if ok == false {
+					DPrintf("Send Request vote failed")
+					return
+				}
+
+				rf.mu.Lock()
+				if rf.currentTerm != args.Term {
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
+
+				if !reply.Vote {
+					// 拒绝投票
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					DPrintf("[Vote]: Peer %d Term %d Vote request rejected by Peer %d", rf.me, rf.currentTerm, i)
+					if rf.currentTerm < reply.Term {
+						DPrintf("[Vote]: Peer %d Term %d term is lower than Peer %d Term %d. Switch back to follower", rf.me, rf.currentTerm,
+							i, reply.Term)
+						rf.currentTerm = reply.Term
+						rf.voteFor = VoteNil
+						rf.switchTo(Follower)
+					}
+				} else {
+					rf.mu.Lock()
+
+					DPrintf("[Vote]: Peer %d Term %d Vote gets vote from Peer %d", rf.me, rf.currentTerm, i)
+					*nVotes += 1
+
+					if rf.state == Candidate && *nVotes >= majority {
+						DPrintf("[Vote] Peer %d Term %d wins the election", rf.me, rf.currentTerm)
+						rf.switchTo(Leader)
+
+						go rf.broadcastHeartbeat()
+					}
+					rf.mu.Unlock()
+				}
+			}(i, rf, &args, &reply)
 		}
-		wg.Add(1)
-		var reply RequestVoteReply
-		go func(i int, rf *Raft, args *RequestVoteArgs, reply *RequestVoteReply) {
-			defer wg.Done()
-			ok := rf.sendRequestVote(i, args, reply)
-			if ok == false {
-				DPrintf("Send Vote Request Failed")
-				return
-			}
-
-			if !reply.Vote {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				DPrintf("[Vote]: Peer %d Term %d Vote request rejected by Peer %d", rf.me, rf.currentTerm, i)
-
-				if rf.currentTerm < reply.Term {
-					DPrintf("[Vote]: Peer %d Term %d term is lower than Peer %d Term %d. Switch back to follower", rf.me, rf.currentTerm,
-						i, reply.Term)
-					rf.currentTerm = reply.Term
-					rf.voteFor = VoteNil
-					rf.switchTo(Follower)
-				}
-			} else {
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				DPrintf("[Vote]: Peer %d Term %d Vote gets vote from Peer %d", rf.me, rf.currentTerm, i)
-				nVotes++
-
-				if rf.state == Candidate && nVotes >= majority {
-					DPrintf("[Vote] Peer %d Term %d wins the election", rf.me, rf.currentTerm)
-					rf.switchTo(Leader)
-
-					// go 发送心跳
-					go rf.broadcastHeartbeat()
-				}
-			}
-		}(i, rf, &args, &reply)
-	}
-	wg.Wait()
+		wg.Wait()
+	}(&nVotes, rf)
 }
 
 func (rf *Raft) broadcastHeartbeat() {
@@ -373,11 +400,23 @@ func (rf *Raft) broadcastHeartbeat() {
 }
 
 func (rf *Raft) broadcastAppendEntries(term int) {
+	var wg sync.WaitGroup
+	majority := len(rf.peers) / 2 + 1
+	isAgree := false
+
 	if _, isLeader := rf.GetState(); !isLeader {
 		return
 	}
 
-	var wg sync.WaitGroup
+	rf.mu.Lock()
+	if rf.currentTerm != term {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+
+	nReplica := 1
+
 	for i, _ := range rf.peers {
 		if i == rf.me {
 			continue
@@ -385,6 +424,20 @@ func (rf *Raft) broadcastAppendEntries(term int) {
 		wg.Add(1)
 
 		go func(i int, rf *Raft) {
+			defer wg.Done()
+
+			// 不是leader
+			if _, isLeader := rf.GetState(); !isLeader {
+				return
+			}
+
+			rf.mu.Lock()
+			if rf.currentTerm != term {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
+
 			rf.mu.Lock()
 			args := AppendEntriesArgs{
 				Term:     term,
@@ -398,6 +451,13 @@ func (rf *Raft) broadcastAppendEntries(term int) {
 				DPrintf("Peer %d send broadcast append entries request failed.", args.LeaderId)
 				return
 			}
+
+			rf.mu.Lock()
+			if rf.currentTerm != args.Term {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
 
 			if !reply.Succ {
 				rf.mu.Lock()
@@ -415,7 +475,12 @@ func (rf *Raft) broadcastAppendEntries(term int) {
 			} else {
 				//
 				rf.mu.Lock()
+				nReplica += 1
 				DPrintf("Peer %d append entries request to peer %d success", rf.me, i)
+				if isAgree == false && rf.state == Leader && nReplica >= majority {
+					isAgree = true
+					//go rf.broadcastHeartbeat()
+				}
 				rf.mu.Unlock()
 			}
 		}(i, rf)
@@ -520,7 +585,7 @@ func (rf *Raft) eventLoop() {
 			rf.mu.Lock()
 			DPrintf("Peer %d Term %d start to broadcast heartbeat.", rf.me, rf.currentTerm)
 			rf.mu.Unlock()
-			// go rf....
+			go rf.broadcastHeartbeat()
 		}
 	}
 }
@@ -558,7 +623,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.log = make([]LogEntry, 0)
 	rf.log = append(rf.log, LogEntry{
-		Term:    0,
+		Term: 0,
 	})
 
 	DPrintf("Application Start. Peer Id: %d", rf.me)
